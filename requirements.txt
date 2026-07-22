@@ -1,0 +1,40 @@
+# SE-LLM-350M — Dependencies
+# Install: pip install -r requirements.txt
+
+# Core deep learning
+torch>=2.1.0
+numpy>=1.24.0
+
+# HuggingFace ecosystem
+datasets>=2.14.0
+tokenizers>=0.14.0
+transformers>=4.35.0
+huggingface-hub>=0.17.0
+
+# Tokenizer training
+sentencepiece>=0.1.99
+
+# Experiment tracking
+wandb>=0.15.0
+
+# Utilities
+tqdm>=4.65.0          # Also pulled in by wandb/datasets automatically
+pyyaml>=6.0
+rich>=13.0.0          # Beautiful console output
+
+# Data processing
+zstandard>=0.21.0    # For compressed dataset files
+pyarrow>=13.0.0      # For parquet/arrow data
+
+# Evaluation
+evaluate>=0.4.0      # HuggingFace evaluate library
+
+# API server (Phase 10)
+fastapi>=0.104.0
+uvicorn>=0.24.0
+slowapi>=0.1.9       # Rate limiting
+python-jose>=3.3.0   # JWT tokens
+passlib>=1.7.4       # Password hashing
+sqlalchemy>=2.0.0    # Database ORM
+stripe>=6.0.0        # Payment processing
+python-dotenv>=1.0.0  # Environment variables

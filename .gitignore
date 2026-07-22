@@ -1,0 +1,49 @@
+# ── Model weights & checkpoints (NEVER commit these) ──────────
+checkpoints/
+checkpoints_sft/
+checkpoints_test/
+export/model_v*/
+*.pt
+*.bin
+*.safetensors
+
+# ── Trained tokenizer (regenerate from script) ────────────────
+tokenizer/tokenizer.json
+tokenizer/tokenizer.model
+
+# ── Data files (too large for Git) ────────────────────────────
+data/processed/
+data/sft/sft_data.jsonl
+
+# ── API secrets ───────────────────────────────────────────────
+api/.env
+.env
+*.key
+
+# ── Database ──────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ── W&B ───────────────────────────────────────────────────────
+wandb/
+
+# ── Evaluation results ────────────────────────────────────────
+evaluation/humaneval_results.jsonl
+
+# ── OS files ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini

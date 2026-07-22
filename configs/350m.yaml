@@ -1,0 +1,92 @@
+# ============================================================
+# SE-LLM-350M — Full Training Configuration
+# 350M parameter instruction-following SE model
+# Training target: Kaggle P100 16GB (16GB VRAM)
+# ============================================================
+
+model:
+  name: "se-llm-350m"
+  architecture: "decoder-only-transformer"
+
+  # Architecture (GPT-2 Medium class, SE-specialized)
+  n_layers: 24          # Transformer blocks (2× the 125M)
+  d_model: 1024         # Hidden dimension
+  n_heads: 16           # Attention heads (head_dim = 64)
+  d_ff: 3072            # FFN intermediate (SwiGLU, ~3× d_model)
+  vocab_size: 32000     # BPE tokenizer vocabulary
+  max_seq_len: 2048     # Context window
+
+  # Modern components
+  rope_base: 10000      # RoPE theta base
+  norm_eps: 1.0e-5      # RMSNorm epsilon
+  dropout: 0.0          # No dropout (modern practice)
+  tie_weights: true     # Share embedding + output weights (~350M params)
+
+  # Special token IDs
+  pad_token_id: 0
+  eos_token_id: 1
+  bos_token_id: 1
+
+data:
+  train_path: "data/processed/train.bin"
+  val_path:   "data/processed/val.bin"
+  tokenizer_path: "tokenizer/tokenizer.json"
+
+training:
+  # Scale
+  total_tokens: 7_000_000_000    # 7.0 billion tokens
+
+  # Batch — tuned for 350M on P100 16GB
+  # 350M uses ~6GB VRAM → still room for batch_size=4 + long seqs
+  batch_size: 4                  # sequences per GPU step (smaller than 125M)
+  sequence_length: 2048          # tokens per sequence
+  gradient_accumulation: 16      # compensates for smaller batch
+  # Effective batch = 4 × 16 × 2048 = 131,072 tokens/step (same as 125M)
+
+  # Gradient checkpointing (saves ~30% VRAM, slight speed cost)
+  gradient_checkpointing: true
+
+  # Optimizer
+  optimizer: "adamw"
+  learning_rate: 2.0e-4          # lower LR for larger model
+  min_lr: 2.0e-5                 # final LR (cosine decay)
+  warmup_steps: 2000             # linear warmup from 0
+  weight_decay: 0.1
+  grad_clip: 1.0
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+
+  # Precision (critical for fitting 350M on P100)
+  dtype: "float16"               # P100 doesn't support bfloat16
+
+  # Checkpointing (critical for Kaggle resume)
+  checkpoint_dir: "checkpoints"
+  save_every: 500                # steps between saves
+  keep_last_n: 3                 # only keep last N checkpoints
+  resume: "auto"                 # auto-detect latest checkpoint
+
+  # Logging
+  log_every: 10
+  eval_every: 1000
+  sample_every: 2000
+  sample_prompt: "def binary_search(arr, target):"
+
+  # W&B
+  wandb_project: "se-llm-350m"
+  wandb_entity: null             # your wandb username
+
+# ── Parameter count breakdown ──────────────────────────────
+# Embeddings:     32,000 × 1024         =  32.8M
+# Per block:
+#   Attention:    4 × 1024 × 1024       =   4.2M
+#   FFN (SwiGLU): 3 × 1024 × 3072      =   9.4M
+#   Norms:        ~2K (negligible)
+#   Per block total:                    =  13.6M
+# 24 blocks:      24 × 13.6M           = 327.0M
+# Total (tie_weights=True):             ≈ 360M params
+#
+# ── Training estimate on P100 ─────────────────────────────
+# Throughput: ~25,000 tokens/sec (350M is 3× heavier than 125M)
+# Steps = 2.5B / (4 × 16 × 2048)      = ~19,073 steps
+# Time  = 2.5B / 25,000               = ~28 hours per epoch
+# Total (Kaggle sessions):             ≈ 3 weeks

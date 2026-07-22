@@ -1,0 +1,61 @@
+# ============================================================
+# SE-LLM — 14M Local Test Config (Demo Coherent Code)
+# Use this to verify valid Python syntax generation locally
+# ============================================================
+
+model:
+  name: "se-llm-14m-test"
+  architecture: "decoder-only-transformer"
+
+  n_layers: 6
+  d_model: 256
+  n_heads: 8            # head_dim = 32
+  d_ff: 1024            # 4 × d_model
+  vocab_size: 32000
+  max_seq_len: 512
+
+  rope_base: 10000
+  norm_eps: 1.0e-5
+  dropout: 0.0
+  tie_weights: true
+
+  pad_token_id: 0
+  eos_token_id: 1
+  bos_token_id: 1
+
+data:
+  train_path: "data/processed/train.bin"
+  val_path:   "data/processed/val.bin"
+  tokenizer_path: "tokenizer/tokenizer.json"
+
+training:
+  total_tokens: 1_998_848       # 244 steps × 8,192 tokens/step (8 × 2 × 512)
+
+  batch_size: 8
+  sequence_length: 512
+  gradient_accumulation: 2
+  # Effective batch = 8 × 2 × 512 = 8,192 tokens/step (244 steps total)
+
+  optimizer: "adamw"
+  learning_rate: 1.0e-3
+  min_lr: 1.0e-4
+  warmup_steps: 50
+  weight_decay: 0.1
+  grad_clip: 1.0
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+
+  dtype: "float32"              # CPU float32
+
+  checkpoint_dir: "checkpoints_test"
+  save_every: 244
+  keep_last_n: 2
+  resume: "none"                # start fresh
+
+  log_every: 5
+  eval_every: 122
+  sample_every: 122
+  sample_prompt: "def hello_world():"
+
+  wandb_project: null
+  wandb_entity: null
