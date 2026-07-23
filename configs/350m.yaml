@@ -36,12 +36,12 @@ training:
   # Scale
   total_tokens: 7_000_000_000    # 7.0 billion tokens
 
-  # Batch — tuned for 350M on P100 16GB
-  # 350M uses ~6GB VRAM → still room for batch_size=4 + long seqs
-  batch_size: 4                  # sequences per GPU step (smaller than 125M)
+  # Batch — tuned for 350M on 16GB GPUs (T4 / P100)
+  # Micro-batch size 2 reduces peak VRAM usage to ~7.5 GB to prevent CUDA OOM
+  batch_size: 2                  # sequences per GPU step
   sequence_length: 2048          # tokens per sequence
-  gradient_accumulation: 16      # compensates for smaller batch
-  # Effective batch = 4 × 16 × 2048 = 131,072 tokens/step (same as 125M)
+  gradient_accumulation: 32      # compensates for micro-batch size
+  # Effective batch = 2 × 32 × 2048 = 131,072 tokens/step
 
   # Gradient checkpointing (saves ~30% VRAM, slight speed cost)
   gradient_checkpointing: true

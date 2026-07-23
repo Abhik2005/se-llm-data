@@ -110,8 +110,9 @@ def train(args: argparse.Namespace) -> None:
     # ── 3. Build model ────────────────────────────────────────────
     model = build_model(model_cfg).to(device)
 
-    # Compile model for speed (PyTorch 2.0+, only on CUDA)
-    if device.type == "cuda" and hasattr(torch, "compile"):
+    # Compile model for speed if enabled in config (PyTorch 2.0+)
+    use_compile = tcfg.get("compile", False)
+    if use_compile and device.type == "cuda" and hasattr(torch, "compile"):
         print("Compiling model with torch.compile()...")
         model = torch.compile(model)
 
