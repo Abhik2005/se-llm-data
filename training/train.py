@@ -146,7 +146,7 @@ def train_worker(index: int, args: argparse.Namespace) -> None:
         backend = f"TPU v5e-8 (8 chips via XLA)" if _XLA_AVAILABLE else \
                   ("CUDA" if torch.cuda.is_available() else "CPU")
         print(f"  Backend: {backend}")
-        print(f"{'='*60}\n")
+        print(f"{'='*60}\n", flush=True)
 
     # ── 2. Device setup ───────────────────────────────────────────
     device, dtype, autocast_ctx = get_device_and_dtype(tcfg.get("dtype", "bfloat16"))
@@ -254,7 +254,7 @@ def train_worker(index: int, args: argparse.Namespace) -> None:
         print(f"Tokens per step: {tokens_per_step:,}")
         print(f"Total steps:     {total_steps:,}")
         print(f"Resume from:     step {start_step:,} ({tokens_processed/1e9:.3f}B tokens)")
-        print(f"Remaining:       {total_steps - start_step:,} steps\n")
+        print(f"Remaining:       {total_steps - start_step:,} steps\n", flush=True)
 
     if start_step >= total_steps:
         if _is_master():
@@ -353,7 +353,8 @@ def train_worker(index: int, args: argparse.Namespace) -> None:
                     f"| lr {lr:.2e} "
                     f"| {tok_sec/1000:.1f}K tok/s "
                     f"| {progress_pct:.1f}% done "
-                    f"| ETA {eta_hours:.1f}h"
+                    f"| ETA {eta_hours:.1f}h",
+                    flush=True
                 )
 
                 if use_wandb:
