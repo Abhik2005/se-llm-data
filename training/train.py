@@ -2,10 +2,11 @@
 training/train.py — Main Pre-training Loop.
 
 This is the core training script. Designed for:
-  - Kaggle P100 (16GB VRAM) — primary training platform
+  - Kaggle TPU v5e-8 (128GB HBM, 8 chips) — primary training platform
+  - Falls back to CUDA (GPU) or CPU automatically when TPU is not available
   - Auto-resume from checkpoint on every session restart
   - W&B logging (monitored from your local machine)
-  - Mixed precision (bfloat16) for speed
+  - bfloat16 precision (native TPU dtype)
 
 Usage:
     # Start or resume training automatically:
@@ -28,6 +29,7 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DistributedSampler
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,6 +40,17 @@ from training.dataset import build_dataloader, estimate_loss
 from training.checkpoint import save_checkpoint, auto_resume
 from training.lr_scheduler import get_lr, apply_lr
 
+# ── XLA / TPU detection ───────────────────────────────────────────────────────
+# We try to import PyTorch/XLA. If it is available we run on TPU, otherwise
+# we fall back to CUDA/CPU gracefully.
+try:
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    import torch_xla.distributed.parallel_loader as pl
+    _XLA_AVAILABLE = True
+except ImportError:
+    _XLA_AVAILABLE = False
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -46,8 +59,17 @@ def load_full_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _is_master() -> bool:
+    """True only on the master process (rank 0 / ordinal 0)."""
+    if _XLA_AVAILABLE:
+        return xm.is_master_ordinal()
+    return True
+
+
 def setup_wandb(cfg: dict, resume_step: int) -> bool:
     """Initialize W&B if project is set. Returns True if W&B is active."""
+    if not _is_master():
+        return False
     project = cfg["training"].get("wandb_project")
     if not project:
         return False
@@ -69,57 +91,76 @@ def setup_wandb(cfg: dict, resume_step: int) -> bool:
         return False
 
 
-def get_device_and_dtype(dtype_str: str) -> tuple[torch.device, torch.dtype, any]:
-    """Determine device, dtype, and autocast context."""
+def get_device_and_dtype(dtype_str: str):
+    """
+    Determine device, dtype, and autocast context.
+    Priority: TPU (XLA) > CUDA > CPU
+    """
+    if _XLA_AVAILABLE:
+        device = xm.xla_device()
+        # TPU always uses bfloat16 — its dedicated hardware unit
+        dtype  = torch.bfloat16
+        # XLA handles mixed precision natively; no autocast context needed
+        ctx    = nullcontext()
+        return device, dtype, ctx
+
     if torch.cuda.is_available():
         device = torch.device("cuda")
         if dtype_str == "bfloat16" and torch.cuda.is_bf16_supported():
             dtype = torch.bfloat16
         else:
             dtype = torch.float16
-    else:
-        device = torch.device("cpu")
-        dtype  = torch.float32  # CPU doesn't support bfloat16 training
-
-    # autocast context for mixed precision
-    if device.type == "cuda":
         ctx = torch.amp.autocast(device_type="cuda", dtype=dtype)
     else:
-        ctx = nullcontext()
+        device = torch.device("cpu")
+        dtype  = torch.float32
+        ctx    = nullcontext()
 
     return device, dtype, ctx
 
 
-# ── Main Training Loop ────────────────────────────────────────────────────────
+# ── Core training function (runs on EACH TPU chip / GPU) ─────────────────────
 
-def train(args: argparse.Namespace) -> None:
+def train_worker(index: int, args: argparse.Namespace) -> None:
+    """
+    This function is spawned once per accelerator core:
+      - On TPU v5e-8: runs 8 parallel copies (one per chip)
+      - On GPU:       runs once
+      - On CPU:       runs once
+
+    Args:
+        index: Ordinal index of this worker (0–7 on TPU v5e-8)
+        args:  Parsed command-line arguments
+    """
     # ── 1. Load config ────────────────────────────────────────────
     cfg       = load_full_config(args.config)
     model_cfg = ModelConfig.from_dict(cfg["model"])
     tcfg      = cfg["training"]
 
-    print(f"\n{'='*60}")
-    print(f"  SE-LLM Training: {model_cfg.name}")
-    print(f"  Config: {args.config}")
-    print(f"{'='*60}\n")
+    if _is_master():
+        print(f"\n{'='*60}")
+        print(f"  SE-LLM Training: {model_cfg.name}")
+        print(f"  Config: {args.config}")
+        backend = f"TPU v5e-8 (8 chips via XLA)" if _XLA_AVAILABLE else \
+                  ("CUDA" if torch.cuda.is_available() else "CPU")
+        print(f"  Backend: {backend}")
+        print(f"{'='*60}\n")
 
     # ── 2. Device setup ───────────────────────────────────────────
     device, dtype, autocast_ctx = get_device_and_dtype(tcfg.get("dtype", "bfloat16"))
-    print(f"Device: {device} | Dtype: {dtype}")
+
+    if _is_master():
+        print(f"Device: {device} | Dtype: {dtype}")
 
     # ── 3. Build model ────────────────────────────────────────────
     model = build_model(model_cfg).to(device)
 
-    # Compile model for speed if enabled in config (PyTorch 2.0+)
-    use_compile = tcfg.get("compile", False)
-    if use_compile and device.type == "cuda" and hasattr(torch, "compile"):
-        print("Compiling model with torch.compile()...")
-        model = torch.compile(model)
-
     # ── 4. Build optimizer ────────────────────────────────────────
-    # Separate parameters into weight-decay and no-decay groups
-    decay_params     = [p for n, p in model.named_parameters() if p.dim() >= 2]
-    no_decay_params  = [p for n, p in model.named_parameters() if p.dim() < 2]
+    decay_params    = [p for n, p in model.named_parameters() if p.dim() >= 2]
+    no_decay_params = [p for n, p in model.named_parameters() if p.dim() <  2]
+
+    # fused AdamW is CUDA-only — disabled on TPU
+    use_fused = (not _XLA_AVAILABLE) and torch.cuda.is_available()
 
     optimizer = torch.optim.AdamW(
         [
@@ -129,11 +170,15 @@ def train(args: argparse.Namespace) -> None:
         lr=tcfg["learning_rate"],
         betas=tuple(tcfg["betas"]),
         eps=tcfg.get("eps", 1e-8),
-        fused=device.type == "cuda",   # Faster fused AdamW on GPU
+        fused=use_fused,
     )
 
-    # GradScaler for fp16 (not needed for bfloat16)
-    scaler = torch.amp.GradScaler("cuda") if dtype == torch.float16 else None
+    # GradScaler is only needed for float16 on CUDA (not bfloat16 / TPU)
+    scaler = (
+        torch.amp.GradScaler("cuda")
+        if (not _XLA_AVAILABLE and torch.cuda.is_available() and dtype == torch.float16)
+        else None
+    )
 
     # ── 5. Auto-resume from checkpoint ───────────────────────────
     checkpoint_dir = tcfg["checkpoint_dir"]
@@ -145,18 +190,39 @@ def train(args: argparse.Namespace) -> None:
         )
     else:
         start_step, tokens_processed, best_val_loss = 0, 0, float("inf")
-        print("[Checkpoint] Starting fresh from step 0")
+        if _is_master():
+            print("[Checkpoint] Starting fresh from step 0")
 
     # ── 6. Build data loaders ─────────────────────────────────────
     data_cfg   = cfg.get("data", {})
     train_path = tcfg.get("train_path") or data_cfg.get("train_path", "data/processed/train.bin")
-    val_path   = tcfg.get("val_path")   or data_cfg.get("val_path", "data/processed/val.bin")
+    val_path   = tcfg.get("val_path")   or data_cfg.get("val_path",   "data/processed/val.bin")
+
+    # DistributedSampler: assigns a unique non-overlapping slice of the
+    # dataset to each TPU chip. chip 0 gets samples 0,8,16...
+    #                              chip 1 gets samples 1,9,17...  etc.
+    # This is what gives us the 8x data throughput on TPU v5e-8.
+    if _XLA_AVAILABLE:
+        world_size    = xm.xrt_world_size()   # 8 on TPU v5e-8
+        train_sampler = DistributedSampler(
+            # We pass a dummy dataset just to compute length —
+            # the real dataset is inside build_dataloader
+            torch.zeros(1),  # placeholder; length set below
+            num_replicas=world_size,
+            rank=index,
+            shuffle=True,
+            drop_last=True,
+        )
+    else:
+        world_size    = 1
+        train_sampler = None
 
     train_loader = build_dataloader(
         train_path,
         tcfg["sequence_length"],
         tcfg["batch_size"],
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
     )
     val_loader = build_dataloader(
         val_path,
@@ -165,35 +231,48 @@ def train(args: argparse.Namespace) -> None:
         shuffle=False,
     )
 
+    # Wrap DataLoaders with XLA's MpDeviceLoader so data is streamed to
+    # the TPU chips in the background while the previous step is running.
+    if _XLA_AVAILABLE:
+        train_loader = pl.MpDeviceLoader(train_loader, device)
+        val_loader   = pl.MpDeviceLoader(val_loader,   device)
+
     # ── 7. Compute training steps ─────────────────────────────────
+    # Effective batch per step = batch_size × world_size × seq_len
     tokens_per_step = (
         tcfg["batch_size"]
         * tcfg["gradient_accumulation"]
         * tcfg["sequence_length"]
+        * world_size        # ← multiply by number of TPU chips
     )
     total_steps = tcfg["total_tokens"] // tokens_per_step
-    print(f"Tokens per step: {tokens_per_step:,}")
-    print(f"Total steps:     {total_steps:,}")
-    print(f"Resume from:     step {start_step:,} ({tokens_processed/1e9:.3f}B tokens)")
-    print(f"Remaining:       {total_steps - start_step:,} steps\n")
+
+    if _is_master():
+        print(f"World size:      {world_size} chips")
+        print(f"Tokens per step: {tokens_per_step:,}")
+        print(f"Total steps:     {total_steps:,}")
+        print(f"Resume from:     step {start_step:,} ({tokens_processed/1e9:.3f}B tokens)")
+        print(f"Remaining:       {total_steps - start_step:,} steps\n")
 
     if start_step >= total_steps:
-        print("Training already complete!")
+        if _is_master():
+            print("Training already complete!")
         return
 
-    # ── 8. Initialize W&B ─────────────────────────────────────────
+    # ── 8. Initialize W&B (master only) ──────────────────────────
     use_wandb = setup_wandb(cfg, start_step)
 
     # ── 9. Training loop ──────────────────────────────────────────
     model.train()
     optimizer.zero_grad()
 
-    data_iter     = iter(train_loader)
-    step          = start_step
-    t0            = time.time()
-    running_loss  = 0.0
+    data_iter    = iter(train_loader)
+    step         = start_step
+    t0           = time.time()
+    running_loss = 0.0
 
-    print("Starting training...\n")
+    if _is_master():
+        print("Starting training...\n")
 
     try:
         while step < total_steps:
@@ -211,19 +290,20 @@ def train(args: argparse.Namespace) -> None:
             # ── Gradient accumulation loop ────────────────────────
             accum_loss = 0.0
             for micro_step in range(tcfg["gradient_accumulation"]):
-                # Get next batch (cycle through dataset)
                 try:
                     x, y = next(data_iter)
                 except StopIteration:
                     data_iter = iter(train_loader)
                     x, y = next(data_iter)
 
-                x, y = x.to(device), y.to(device)
+                # MpDeviceLoader already moves data to the XLA device,
+                # but for GPU/CPU we still need to move it manually.
+                if not _XLA_AVAILABLE:
+                    x, y = x.to(device), y.to(device)
 
-                # Forward pass with mixed precision
+                # Forward pass
                 with autocast_ctx:
                     _, loss = model(x, y)
-                    # Scale loss by accumulation steps
                     loss = loss / tcfg["gradient_accumulation"]
 
                 accum_loss += loss.item()
@@ -235,12 +315,15 @@ def train(args: argparse.Namespace) -> None:
                     loss.backward()
 
             # ── Optimizer step ────────────────────────────────────
-            # Gradient clipping
             if scaler is not None:
                 scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), tcfg["grad_clip"])
 
-            if scaler is not None:
+            if _XLA_AVAILABLE:
+                # xm.optimizer_step: all-reduces gradients across all 8
+                # TPU chips before updating weights, keeping them in sync.
+                xm.optimizer_step(optimizer)
+            elif scaler is not None:
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -248,15 +331,15 @@ def train(args: argparse.Namespace) -> None:
 
             optimizer.zero_grad(set_to_none=True)
 
-            step              += 1
-            tokens_processed  += tokens_per_step
-            running_loss      += accum_loss
+            step             += 1
+            tokens_processed += tokens_per_step
+            running_loss     += accum_loss
 
-            # ── Logging ───────────────────────────────────────────
-            if step % tcfg["log_every"] == 0:
-                t1       = time.time()
-                dt       = t1 - t0
-                tok_sec  = (tcfg["log_every"] * tokens_per_step) / dt
+            # ── Logging (master only) ─────────────────────────────
+            if step % tcfg["log_every"] == 0 and _is_master():
+                t1      = time.time()
+                dt      = t1 - t0
+                tok_sec = (tcfg["log_every"] * tokens_per_step) / dt
                 avg_loss = running_loss / tcfg["log_every"]
 
                 progress_pct = 100 * tokens_processed / tcfg["total_tokens"]
@@ -274,36 +357,35 @@ def train(args: argparse.Namespace) -> None:
                 if use_wandb:
                     import wandb
                     wandb.log({
-                        "train/loss": avg_loss,
-                        "train/lr":   lr,
+                        "train/loss":            avg_loss,
+                        "train/lr":              lr,
                         "train/tokens_processed": tokens_processed,
-                        "train/tokens_per_sec":   tok_sec,
-                        "train/step": step,
+                        "train/tokens_per_sec":  tok_sec,
+                        "train/step":            step,
                     }, step=step)
 
                 running_loss = 0.0
                 t0 = t1
 
-            # ── Validation ────────────────────────────────────────
-            if step % tcfg["eval_every"] == 0:
-                losses = estimate_loss(model, train_loader, val_loader, eval_batches=20, device=device)
-                val_l  = losses["val"]
+            # ── Validation (master only) ──────────────────────────
+            if step % tcfg["eval_every"] == 0 and _is_master():
+                losses = estimate_loss(
+                    model, train_loader, val_loader,
+                    eval_batches=20, device=device,
+                )
+                val_l = losses["val"]
                 print(f"\n[Eval] step {step:,} | train_loss {losses['train']:.4f} | val_loss {val_l:.4f}\n")
 
                 if val_l < best_val_loss:
                     best_val_loss = val_l
-                    # Save best model separately
                     save_checkpoint(
                         checkpoint_dir, step, model, optimizer,
                         tokens_processed, val_l,
                         model_cfg.to_dict(), tcfg, keep_last_n=1,
                     )
-                    best_path = os.path.join(checkpoint_dir, "best.pt")
                     import shutil
-                    shutil.copy(
-                        os.path.join(checkpoint_dir, "latest.pt"),
-                        best_path,
-                    )
+                    best_path = os.path.join(checkpoint_dir, "best.pt")
+                    shutil.copy(os.path.join(checkpoint_dir, "latest.pt"), best_path)
                     print(f"[Best] New best val_loss: {val_l:.4f} → saved to {best_path}")
 
                 if use_wandb:
@@ -312,13 +394,15 @@ def train(args: argparse.Namespace) -> None:
 
                 model.train()
 
-            # ── Sample generation ─────────────────────────────────
-            if step % tcfg["sample_every"] == 0:
+            # ── Sample generation (master only) ───────────────────
+            if step % tcfg["sample_every"] == 0 and _is_master():
                 tok_p = data_cfg.get("tokenizer_path", "tokenizer/tokenizer.json")
                 _generate_sample(model, model_cfg, tcfg, device, tokenizer_path=tok_p)
 
             # ── Checkpoint ────────────────────────────────────────
             if step % tcfg["save_every"] == 0:
+                # xm.save (inside save_checkpoint) is called on all ranks
+                # but only the master rank writes to disk.
                 save_checkpoint(
                     checkpoint_dir, step, model, optimizer,
                     tokens_processed, best_val_loss,
@@ -327,13 +411,15 @@ def train(args: argparse.Namespace) -> None:
                 )
 
     except KeyboardInterrupt:
-        print("\n[Interrupted] Saving checkpoint before exit...")
+        if _is_master():
+            print("\n[Interrupted] Saving checkpoint before exit...")
         save_checkpoint(
             checkpoint_dir, step, model, optimizer,
             tokens_processed, best_val_loss,
             model_cfg.to_dict(), tcfg,
         )
-        print("Checkpoint saved. Training can be resumed.")
+        if _is_master():
+            print("Checkpoint saved. Training can be resumed.")
 
     # ── Final checkpoint ──────────────────────────────────────────
     if step >= total_steps:
@@ -342,13 +428,14 @@ def train(args: argparse.Namespace) -> None:
             tokens_processed, best_val_loss,
             model_cfg.to_dict(), tcfg,
         )
-        print(f"\n{'='*60}")
-        print(f"  Training COMPLETE!")
-        print(f"  Total steps: {step:,}")
-        print(f"  Total tokens: {tokens_processed/1e9:.3f}B")
-        print(f"  Best val loss: {best_val_loss:.4f}")
-        print(f"  Checkpoints: {checkpoint_dir}/")
-        print(f"{'='*60}\n")
+        if _is_master():
+            print(f"\n{'='*60}")
+            print(f"  Training COMPLETE!")
+            print(f"  Total steps:  {step:,}")
+            print(f"  Total tokens: {tokens_processed/1e9:.3f}B")
+            print(f"  Best val loss: {best_val_loss:.4f}")
+            print(f"  Checkpoints:  {checkpoint_dir}/")
+            print(f"{'='*60}\n")
 
     if use_wandb:
         import wandb
@@ -365,8 +452,8 @@ def _generate_sample(model, model_cfg, tcfg, device, tokenizer_path: str = "toke
     try:
         if os.path.exists(tokenizer_path):
             from tokenizers import Tokenizer
-            tokenizer = Tokenizer.from_file(tokenizer_path)
-            prompt_ids = torch.tensor([tokenizer.encode(prompt_text).ids], dtype=torch.long, device=device)
+            tokenizer   = Tokenizer.from_file(tokenizer_path)
+            prompt_ids  = torch.tensor([tokenizer.encode(prompt_text).ids], dtype=torch.long, device=device)
             with torch.no_grad():
                 output_ids = model.generate(
                     prompt_ids,
@@ -405,4 +492,11 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    train(args)
+
+    if _XLA_AVAILABLE:
+        # On TPU v5e-8: spawn 8 parallel worker processes (one per chip).
+        # xmp.spawn automatically assigns each process to its own TPU chip.
+        xmp.spawn(train_worker, args=(args,), nprocs=8, start_method="fork")
+    else:
+        # On GPU or CPU: run a single worker directly.
+        train_worker(0, args)

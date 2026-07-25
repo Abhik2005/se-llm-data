@@ -21,6 +21,15 @@ import torch
 from pathlib import Path
 from typing import Optional
 
+# Import XLA model utilities for TPU-safe checkpoint saving.
+# On a TPU, weights are sharded across 8 chips — xm.save gathers them
+# all onto the master chip before writing, preventing corruption.
+try:
+    import torch_xla.core.xla_model as xm
+    _XLA_AVAILABLE = True
+except ImportError:
+    _XLA_AVAILABLE = False
+
 
 def save_checkpoint(
     checkpoint_dir: str,
@@ -63,17 +72,22 @@ def save_checkpoint(
     }
 
     # Save step-specific checkpoint
-    ckpt_path = os.path.join(checkpoint_dir, f"checkpoint_step_{step:07d}.pt")
-    torch.save(checkpoint, ckpt_path)
-
-    # Also save as 'latest.pt' for easy resume
+    ckpt_path   = os.path.join(checkpoint_dir, f"checkpoint_step_{step:07d}.pt")
     latest_path = os.path.join(checkpoint_dir, "latest.pt")
-    torch.save(checkpoint, latest_path)
 
-    print(f"[Checkpoint] Saved step {step:,} → {ckpt_path}")
+    if _XLA_AVAILABLE:
+        # xm.save: gathers weights from all 8 TPU chips onto the master
+        # chip before writing — prevents file corruption and hangs.
+        xm.save(checkpoint, ckpt_path)
+        xm.save(checkpoint, latest_path)
+    else:
+        torch.save(checkpoint, ckpt_path)
+        torch.save(checkpoint, latest_path)
 
-    # Prune old checkpoints (keep only last N)
-    _prune_old_checkpoints(checkpoint_dir, keep_last_n)
+    # Only log and prune on the master process to avoid duplicate output
+    if not _XLA_AVAILABLE or xm.is_master_ordinal():
+        print(f"[Checkpoint] Saved step {step:,} → {ckpt_path}")
+        _prune_old_checkpoints(checkpoint_dir, keep_last_n)
 
     return ckpt_path
 

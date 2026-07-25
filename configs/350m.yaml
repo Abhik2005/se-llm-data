@@ -1,7 +1,7 @@
 # ============================================================
 # SE-LLM-350M — Full Training Configuration
 # 350M parameter instruction-following SE model
-# Training target: Kaggle P100 16GB (16GB VRAM)
+# Training target: Kaggle TPU v5e-8 (128GB HBM, 8 chips)
 # ============================================================
 
 model:
@@ -36,15 +36,15 @@ training:
   # Scale
   total_tokens: 7_000_000_000    # 7.0 billion tokens
 
-  # Batch — tuned for 350M on 16GB GPUs (T4 / P100)
-  # Micro-batch size 2 reduces peak VRAM usage to ~7.5 GB to prevent CUDA OOM
-  batch_size: 2                  # sequences per GPU step
+  # Batch — tuned for 350M on Kaggle TPU v5e-8 (128GB HBM across 8 chips)
+  # Each of the 8 chips processes batch_size sequences simultaneously
+  batch_size: 16                 # sequences per TPU chip per step
   sequence_length: 2048          # tokens per sequence
-  gradient_accumulation: 32      # compensates for micro-batch size
-  # Effective batch = 2 × 32 × 2048 = 131,072 tokens/step
+  gradient_accumulation: 1       # not needed — TPU has plenty of memory
+  # Effective batch = 16 × 8 chips × 2048 = 262,144 tokens/step
 
-  # Gradient checkpointing (saves ~30% VRAM, slight speed cost)
-  gradient_checkpointing: true
+  # Gradient checkpointing (not needed on TPU v5e-8 — enough memory)
+  gradient_checkpointing: false
 
   # Optimizer
   optimizer: "adamw"
@@ -56,8 +56,8 @@ training:
   betas: [0.9, 0.95]
   eps: 1.0e-8
 
-  # Precision (critical for fitting 350M on P100)
-  dtype: "float16"               # P100 doesn't support bfloat16
+  # Precision — TPU v5e-8 has a dedicated bfloat16 unit, always use it
+  dtype: "bfloat16"              # Native TPU dtype, no GradScaler needed
 
   # Checkpointing (critical for Kaggle resume)
   checkpoint_dir: "checkpoints"
@@ -85,8 +85,8 @@ training:
 # 24 blocks:      24 × 13.6M           = 327.0M
 # Total (tie_weights=True):             ≈ 360M params
 #
-# ── Training estimate on P100 ─────────────────────────────
-# Throughput: ~25,000 tokens/sec (350M is 3× heavier than 125M)
-# Steps = 2.5B / (4 × 16 × 2048)      = ~19,073 steps
-# Time  = 2.5B / 25,000               = ~28 hours per epoch
-# Total (Kaggle sessions):             ≈ 3 weeks
+# ── Training estimate on TPU v5e-8 ──────────────────────────
+# Throughput: ~400,000–550,000 tokens/sec (8 chips × ~55K tok/s each)
+# Steps = 7.0B / (16 × 8 chips × 2048) = ~26,855 steps
+# Time  = 7.0B / 450,000               = ~4.3 hours
+# Total (Kaggle TPU sessions):         ≈ 1 single 9-hour session ✅

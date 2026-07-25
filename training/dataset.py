@@ -73,6 +73,7 @@ def build_dataloader(
     batch_size: int,
     shuffle: bool = True,
     num_workers: int = 0,
+    sampler=None,
 ) -> DataLoader:
     """
     Build a DataLoader for the tokenized dataset.
@@ -81,20 +82,27 @@ def build_dataloader(
         data_path:       Path to .bin file
         sequence_length: Tokens per sequence
         batch_size:      Sequences per batch
-        shuffle:         Whether to shuffle samples
+        shuffle:         Whether to shuffle samples (ignored when sampler is set)
         num_workers:     Parallel data loading workers
+        sampler:         Optional sampler (e.g. DistributedSampler for TPU)
 
     Returns:
         PyTorch DataLoader
     """
     dataset = TokenDataset(data_path, sequence_length)
+
+    # sampler and shuffle are mutually exclusive in PyTorch
+    if sampler is not None:
+        shuffle = False
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),  # Faster GPU transfer
-        drop_last=True,                         # Consistent batch sizes
+        pin_memory=False,  # pin_memory is GPU-only — disabled for TPU/XLA
+        drop_last=True,    # Consistent batch sizes across all chips
     )
 
 
