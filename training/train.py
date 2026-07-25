@@ -47,6 +47,7 @@ try:
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.xla_multiprocessing as xmp
     import torch_xla.distributed.parallel_loader as pl
+    import torch_xla.runtime as xr
     _XLA_AVAILABLE = True
 except ImportError:
     _XLA_AVAILABLE = False
@@ -203,7 +204,7 @@ def train_worker(index: int, args: argparse.Namespace) -> None:
     #                              chip 1 gets samples 1,9,17...  etc.
     # This is what gives us the 8x data throughput on TPU v5e-8.
     if _XLA_AVAILABLE:
-        world_size    = xm.xrt_world_size()   # 8 on TPU v5e-8
+        world_size    = xr.world_size()   # 8 on TPU v5e-8
         train_sampler = DistributedSampler(
             # We pass a dummy dataset just to compute length —
             # the real dataset is inside build_dataloader
