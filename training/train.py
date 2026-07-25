@@ -48,6 +48,7 @@ try:
     import torch_xla.distributed.xla_multiprocessing as xmp
     import torch_xla.distributed.parallel_loader as pl
     import torch_xla.runtime as xr
+    import torch_xla
     _XLA_AVAILABLE = True
 except ImportError:
     _XLA_AVAILABLE = False
@@ -98,7 +99,7 @@ def get_device_and_dtype(dtype_str: str):
     Priority: TPU (XLA) > CUDA > CPU
     """
     if _XLA_AVAILABLE:
-        device = xm.xla_device()
+        device = torch_xla.device()
         # TPU always uses bfloat16 — its dedicated hardware unit
         dtype  = torch.bfloat16
         # XLA handles mixed precision natively; no autocast context needed
