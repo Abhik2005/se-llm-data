@@ -75,11 +75,12 @@ python data/prepare_data.py
 python training/train.py --config configs/1m_test.yaml
 ```
 
-### 5. Train the full 350M model on Kaggle
+### 5. Train the full 350M model on Kaggle TPU v5e-8
 - Upload `data/processed/train.bin` and `val.bin` to a Kaggle Dataset
 - Open `notebooks/kaggle_pretrain.ipynb` on Kaggle
-- Select `--config configs/350m.yaml`
-- Enable P100 GPU, run all cells
+- Go to **Settings → Accelerator → TPU v5e-8**
+- Click **Save Version → Save & Run All (Commit)**
+- Training completes in **~4–8 hours** in a single session ✅
 
 ### 6. Test the trained model
 ```bash
@@ -111,10 +112,10 @@ python evaluation/generate.py --checkpoint checkpoints/best.pt --mode completion
 
 ## Training
 
-- **Pre-training**: 2.5B tokens from The Stack v2 (MIT/Apache licensed code)
+- **Pre-training**: 7.0B tokens from The Stack v2 (MIT/Apache licensed code)
 - **Fine-tuning**: 255K instruction-response pairs (ChatML format)
-- **Hardware**: Kaggle P100 16GB (free tier)
-- **Duration**: ~3 weeks of Kaggle sessions (auto-resume)
+- **Hardware**: Kaggle TPU v5e-8 (128 GB HBM, 8 chips — free tier, 20 hrs/week)
+- **Duration**: ~4–8 hours (single Kaggle session)
 
 ---
 
