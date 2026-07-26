@@ -609,10 +609,10 @@ if __name__ == "__main__":
     args = parse_args()
 
     if _XLA_AVAILABLE:
-        # On TPU v5e-8: spawn 8 parallel worker processes (one per chip).
+        # On TPU v5e-8: spawn parallel worker processes (one per chip).
         # xmp.spawn automatically assigns each process to its own TPU chip.
         # NOTE: start_method must be "fork" on Kaggle PJRT to prevent XLA double-initialization crashes.
-        xmp.spawn(train_worker, args=(args,), nprocs=8, start_method="fork")
+        xmp.spawn(train_worker, args=(args,), nprocs=None, start_method="fork")
     else:
         # On GPU or CPU: run a single worker directly.
         train_worker(0, args)
