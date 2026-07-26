@@ -17,6 +17,26 @@ Usage:
 
     # Test with tiny model on CPU:
     python training/train.py --config configs/1m_test.yaml
+
+Fixes applied (vs original):
+  BUG-1 DEADLOCK  — estimate_loss / _generate_sample were master-only;
+                    non-masters hit xm.optimizer_step() on next iteration
+                    while master was still in eval → stall. Fix: all ranks
+                    run estimate_loss; only master logs / writes best.pt.
+  BUG-2 XLA SYNC  — loss.item() called every micro-step inside the
+                    gradient-accumulation loop, forcing an XLA graph
+                    compilation + device sync on every micro-step.
+                    Fix: accumulate as on-device tensor; single .item()
+                    after the full accumulation loop.
+  BUG-3 EMPTY DATA — DistributedSampler received torch.zeros(1) as its
+                    dataset (len=1). With world_size=8 and drop_last=True
+                    each rank got 0 sample indices → empty DataLoader.
+                    Fix: _DatasetLenProxy infers real sequence count from
+                    file size so every rank gets its correct data slice.
+  BUG-4 FP32 MODEL — model.to(device) only moved to device, never cast
+                    to bfloat16. No autocast on TPU (nullcontext) so model
+                    ran in float32 — 2× memory, slower, dtype mismatch risk.
+                    Fix: model.to(device=device, dtype=dtype).
 """
 
 import os
@@ -71,6 +91,39 @@ def _is_master() -> bool:
     if _XLA_AVAILABLE:
         return xm.is_master_ordinal()
     return True
+
+
+# ── BUG-3 FIX: proper dataset-length proxy for DistributedSampler ────────────
+
+class _DatasetLenProxy:
+    """
+    Minimal dataset-like object that only exposes __len__.
+
+    DistributedSampler uses len(dataset) to compute per-rank index slices.
+    The original code passed torch.zeros(1) here (len=1), so with
+    world_size=8 and drop_last=True every rank got 0 sample indices and the
+    DataLoader produced no batches at all.
+    """
+    def __init__(self, length: int) -> None:
+        self._length = length
+
+    def __len__(self) -> int:
+        return self._length
+
+
+def _bin_n_sequences(path: str, sequence_length: int, token_bytes: int = 2) -> int:
+    """
+    Estimate number of complete token sequences in a flat binary token file.
+
+    Default token_bytes=2 assumes uint16 tokens (standard nanoGPT-style .bin).
+    Pass token_bytes=4 if your pipeline writes int32 tokens.
+    """
+    try:
+        file_bytes = os.path.getsize(path)
+        n = file_bytes // (sequence_length * token_bytes)
+        return max(1, n)
+    except OSError:
+        return 1  # path not found yet; will fail loudly later in DataLoader
 
 
 def setup_wandb(cfg: dict, resume_step: int) -> bool:
@@ -160,7 +213,9 @@ def train_worker(index: int, args: argparse.Namespace) -> None:
         print(f"Device: {device} | Dtype: {dtype}")
 
     # ── 3. Build model ────────────────────────────────────────────
-    model = build_model(model_cfg).to(device)
+    # BUG-4 FIX: pass dtype= so model weights are bfloat16 on TPU, not float32.
+    # Original: build_model(model_cfg).to(device)  ← device only, stays float32
+    model = build_model(model_cfg).to(device=device, dtype=dtype)
 
     # ── 4. Build optimizer ────────────────────────────────────────
     decay_params    = [p for n, p in model.named_parameters() if p.dim() >= 2]
@@ -210,11 +265,16 @@ def train_worker(index: int, args: argparse.Namespace) -> None:
     #                              chip 1 gets samples 1,9,17...  etc.
     # This is what gives us the 8x data throughput on TPU v5e-8.
     if _XLA_AVAILABLE:
-        world_size    = xr.world_size()   # 8 on TPU v5e-8
+        world_size = xr.world_size()   # 8 on TPU v5e-8
+
+        # BUG-3 FIX: original code passed torch.zeros(1) as the dataset
+        # argument (len=1). DistributedSampler uses len() to build its index
+        # list, so every rank ended up with 0 sample indices and the DataLoader
+        # produced zero batches. We now pass a proxy whose length reflects the
+        # actual number of sequences in the binary token file.
+        n_train_seqs  = _bin_n_sequences(train_path, tcfg["sequence_length"])
         train_sampler = DistributedSampler(
-            # We pass a dummy dataset just to compute length —
-            # the real dataset is inside build_dataloader
-            torch.zeros(1),  # placeholder; length set below
+            _DatasetLenProxy(n_train_seqs),
             num_replicas=world_size,
             rank=index,
             shuffle=True,
@@ -295,7 +355,13 @@ def train_worker(index: int, args: argparse.Namespace) -> None:
             apply_lr(optimizer, lr)
 
             # ── Gradient accumulation loop ────────────────────────
-            accum_loss = 0.0
+            # BUG-2 FIX: original code called loss.item() inside this loop,
+            # forcing an XLA graph compilation + device sync on every micro-step
+            # (e.g. 4 forced syncs per step when gradient_accumulation=4).
+            # Fix: keep the running sum as an on-device tensor and call .item()
+            # exactly once after the full accumulation loop is done.
+            accum_loss_t = torch.zeros(1, device=device, dtype=torch.float32)
+
             for micro_step in range(tcfg["gradient_accumulation"]):
                 try:
                     x, y = next(data_iter)
@@ -313,13 +379,17 @@ def train_worker(index: int, args: argparse.Namespace) -> None:
                     _, loss = model(x, y)
                     loss = loss / tcfg["gradient_accumulation"]
 
-                accum_loss += loss.item()
+                # Accumulate loss on-device — NO .item() here (would force XLA sync)
+                accum_loss_t += loss.detach()
 
                 # Backward pass
                 if scaler is not None:
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
+
+            # Single device→host sync after the full accumulation loop
+            accum_loss = accum_loss_t.item()
 
             # ── Optimizer step ────────────────────────────────────
             if scaler is not None:
@@ -375,15 +445,36 @@ def train_worker(index: int, args: argparse.Namespace) -> None:
                 running_loss = 0.0
                 t0 = t1
 
-            # ── Validation (master only) ──────────────────────────
-            if step % tcfg["eval_every"] == 0 and _is_master():
+            # ── Validation (ALL ranks) ────────────────────────────
+            # BUG-1 FIX: original code wrapped estimate_loss in _is_master(),
+            # so only rank 0 ran the forward passes.  On the NEXT training
+            # step, ranks 1-7 reach xm.optimizer_step() (an all-reduce
+            # collective) while rank 0 is still inside estimate_loss → stall.
+            #
+            # Fix: ALL ranks call estimate_loss so no rank drifts ahead.
+            # We then all-reduce the loss values so every rank (and W&B) sees
+            # the global average rather than one shard's local estimate.
+            # Only master rank prints / saves / logs to W&B.
+            if step % tcfg["eval_every"] == 0:
                 losses = estimate_loss(
                     model, train_loader, val_loader,
                     eval_batches=20, device=device,
                 )
-                val_l = losses["val"]
-                print(f"\n[Eval] step {step:,} | train_loss {losses['train']:.4f} | val_loss {val_l:.4f}\n")
 
+                # Average loss across all TPU chips for accurate global estimate
+                if _XLA_AVAILABLE:
+                    for key in ("train", "val"):
+                        t = torch.tensor(losses[key], device=device, dtype=torch.float32)
+                        xm.all_reduce(xm.REDUCE_SUM, t, scale=1.0 / xr.world_size())
+                        losses[key] = t.item()
+
+                val_l = losses["val"]
+
+                if _is_master():
+                    print(f"\n[Eval] step {step:,} | train_loss {losses['train']:.4f} | val_loss {val_l:.4f}\n")
+
+                # All ranks update best_val_loss and call save_checkpoint
+                # together (safe if save_checkpoint uses xm.save internally).
                 if val_l < best_val_loss:
                     best_val_loss = val_l
                     save_checkpoint(
@@ -391,23 +482,27 @@ def train_worker(index: int, args: argparse.Namespace) -> None:
                         tokens_processed, val_l,
                         model_cfg.to_dict(), tcfg, keep_last_n=1,
                     )
-                    import shutil
-                    best_path = os.path.join(checkpoint_dir, "best.pt")
-                    shutil.copy(os.path.join(checkpoint_dir, "latest.pt"), best_path)
-                    print(f"[Best] New best val_loss: {val_l:.4f} → saved to {best_path}")
+                    if _is_master():
+                        import shutil
+                        best_path = os.path.join(checkpoint_dir, "best.pt")
+                        shutil.copy(os.path.join(checkpoint_dir, "latest.pt"), best_path)
+                        print(f"[Best] New best val_loss: {val_l:.4f} → saved to {best_path}")
 
-                if use_wandb:
+                if _is_master() and use_wandb:
                     import wandb
                     wandb.log({"val/loss": val_l, "val/step": step}, step=step)
 
                 model.train()
 
             # ── Sample generation (master only) ───────────────────
+            # This is a local forward pass with no XLA collectives, so
+            # calling it on master only is safe: non-masters are free to
+            # start the next training step's micro-steps independently.
             if step % tcfg["sample_every"] == 0 and _is_master():
                 tok_p = data_cfg.get("tokenizer_path", "tokenizer/tokenizer.json")
                 _generate_sample(model, model_cfg, tcfg, device, tokenizer_path=tok_p)
 
-            # ── Checkpoint ────────────────────────────────────────
+            # ── Periodic checkpoint (all ranks) ───────────────────
             if step % tcfg["save_every"] == 0:
                 # xm.save (inside save_checkpoint) is called on all ranks
                 # but only the master rank writes to disk.
@@ -452,8 +547,14 @@ def train_worker(index: int, args: argparse.Namespace) -> None:
 
 # ── Sample generation helper ──────────────────────────────────────────────────
 
-def _generate_sample(model, model_cfg, tcfg, device, tokenizer_path: str = "tokenizer/tokenizer.json") -> None:
-    """Generate a sample to qualitatively check model quality."""
+def _generate_sample(
+    model,
+    model_cfg,
+    tcfg,
+    device,
+    tokenizer_path: str = "tokenizer/tokenizer.json",
+) -> None:
+    """Generate a sample to qualitatively check model quality (master only)."""
     model.eval()
     prompt_text = tcfg.get("sample_prompt", "def hello_world():")
 
@@ -461,7 +562,11 @@ def _generate_sample(model, model_cfg, tcfg, device, tokenizer_path: str = "toke
         if os.path.exists(tokenizer_path):
             from tokenizers import Tokenizer
             tokenizer   = Tokenizer.from_file(tokenizer_path)
-            prompt_ids  = torch.tensor([tokenizer.encode(prompt_text).ids], dtype=torch.long, device=device)
+            prompt_ids  = torch.tensor(
+                [tokenizer.encode(prompt_text).ids],
+                dtype=torch.long,
+                device=device,
+            )
             with torch.no_grad():
                 output_ids = model.generate(
                     prompt_ids,
