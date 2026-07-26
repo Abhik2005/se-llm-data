@@ -499,7 +499,7 @@ if __name__ == "__main__":
     if _XLA_AVAILABLE:
         # On TPU v5e-8: spawn 8 parallel worker processes (one per chip).
         # xmp.spawn automatically assigns each process to its own TPU chip.
-        xmp.spawn(train_worker, args=(args,), nprocs=8, start_method="fork")
+        xmp.spawn(train_worker, args=(args,), nprocs=None, start_method="spawn")
     else:
         # On GPU or CPU: run a single worker directly.
         train_worker(0, args)
