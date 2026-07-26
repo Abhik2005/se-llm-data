@@ -65,11 +65,11 @@ from training.lr_scheduler import get_lr, apply_lr
 # we fall back to CUDA/CPU gracefully.
 
 # Kaggle TPU environment fix: CLOUD_TPU_TASK_ID breaks PJRT worker rank detection.
-# TPU_PROCESS_ADDRESSES must NOT be removed — it tells XLA about all 8 chips.
-# Removing it causes XLA to fall back to single-chip "local" mode.
-# NOTE: In newer Kaggle environments (PJRT), popping CLOUD_TPU_TASK_ID breaks XLA 
-# initialization (causing "Expected 8 worker addresses, got 1"), so it is commented out.
-# os.environ.pop('CLOUD_TPU_TASK_ID', None)
+# TPU_PROCESS_ADDRESSES="local" on Kaggle TPU v5e-8 breaks the PJRT slice builder 
+# and causes "Expected 8 worker addresses, got 1". Both must be popped for PJRT to 
+# correctly auto-detect the 8 TPU cores.
+os.environ.pop('CLOUD_TPU_TASK_ID', None)
+os.environ.pop('TPU_PROCESS_ADDRESSES', None)
 try:
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.xla_multiprocessing as xmp
