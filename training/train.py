@@ -44,8 +44,9 @@ from training.lr_scheduler import get_lr, apply_lr
 # We try to import PyTorch/XLA. If it is available we run on TPU, otherwise
 # we fall back to CUDA/CPU gracefully.
 
-# Kaggle TPU environment fix: Kaggle injects variables that break PJRT on v5e-8
-os.environ.pop('TPU_PROCESS_ADDRESSES', None)
+# Kaggle TPU environment fix: CLOUD_TPU_TASK_ID breaks PJRT worker rank detection.
+# TPU_PROCESS_ADDRESSES must NOT be removed — it tells XLA about all 8 chips.
+# Removing it causes XLA to fall back to single-chip "local" mode.
 os.environ.pop('CLOUD_TPU_TASK_ID', None)
 try:
     import torch_xla.core.xla_model as xm
@@ -503,7 +504,7 @@ if __name__ == "__main__":
     if _XLA_AVAILABLE:
         # On TPU v5e-8: spawn 8 parallel worker processes (one per chip).
         # xmp.spawn automatically assigns each process to its own TPU chip.
-        xmp.spawn(train_worker, args=(args,), nprocs=None, start_method="fork")
+        xmp.spawn(train_worker, args=(args,), nprocs=None, start_method="spawn")
     else:
         # On GPU or CPU: run a single worker directly.
         train_worker(0, args)
