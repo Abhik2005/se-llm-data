@@ -43,6 +43,10 @@ from training.lr_scheduler import get_lr, apply_lr
 # ── XLA / TPU detection ───────────────────────────────────────────────────────
 # We try to import PyTorch/XLA. If it is available we run on TPU, otherwise
 # we fall back to CUDA/CPU gracefully.
+
+# Kaggle TPU environment fix: Kaggle injects variables that break PJRT on v5e-8
+os.environ.pop('TPU_PROCESS_ADDRESSES', None)
+os.environ.pop('CLOUD_TPU_TASK_ID', None)
 try:
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.xla_multiprocessing as xmp
