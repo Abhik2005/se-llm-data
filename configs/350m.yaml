@@ -1,11 +1,11 @@
 # ============================================================
-# SE-LLM-350M — Full Training Configuration
+# Aarohan-350M — Full Training Configuration
 # 350M parameter instruction-following SE model
 # Training target: Kaggle TPU v5e-8 (128GB HBM, 8 chips)
 # ============================================================
 
 model:
-  name: "se-llm-350m"
+  name: "Aarohan-350M"
   architecture: "decoder-only-transformer"
 
   # Architecture (GPT-2 Medium class, SE-specialized)
