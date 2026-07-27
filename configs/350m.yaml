@@ -38,13 +38,13 @@ training:
 
   # Batch — tuned for 350M on Kaggle TPU v5e-8 (128GB HBM across 8 chips)
   # Each of the 8 chips processes batch_size sequences simultaneously
-  batch_size: 16                 # sequences per TPU chip per step
+  batch_size: 8                  # sequences per TPU chip per step
   sequence_length: 2048          # tokens per sequence
-  gradient_accumulation: 1       # not needed — TPU has plenty of memory
-  # Effective batch = 16 × 8 chips × 2048 = 262,144 tokens/step
+  gradient_accumulation: 1       # Keep 1 to prevent XLA from unrolling the graph
+  # Effective batch = 8 × 8 chips × 2048 = 131,072 tokens/step
 
-  # Gradient checkpointing (not needed on TPU v5e-8 — enough memory)
-  gradient_checkpointing: false
+  # Gradient checkpointing saves massive memory during backward pass
+  gradient_checkpointing: true
 
   # Optimizer
   optimizer: "adamw"
