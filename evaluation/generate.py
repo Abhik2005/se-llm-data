@@ -54,13 +54,16 @@ def generate_completion(
     temperature: float = 0.8,
     top_k: int = 50,
     top_p: float = 0.95,
+    eos_token_id: int = None,
     device: torch.device = torch.device("cpu"),
 ) -> str:
     """Generate a code completion from a prompt."""
     input_ids = tokenizer.encode(prompt).ids
     input_tensor = torch.tensor([input_ids], dtype=torch.long).to(device)
 
-    eos_id = tokenizer.token_to_id("<|endoftext|>")
+    # Default EOS to <|endoftext|>; chat mode passes <|im_end|> instead
+    if eos_token_id is None:
+        eos_token_id = tokenizer.token_to_id("<|endoftext|>")
 
     with torch.no_grad():
         output = model.generate(
@@ -69,7 +72,7 @@ def generate_completion(
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
-            eos_token_id=eos_id,
+            eos_token_id=eos_token_id,
         )
 
     generated_ids = output[0, len(input_ids):].tolist()
@@ -80,7 +83,7 @@ def chat_turn(
     model: Transformer,
     tokenizer,
     user_message: str,
-    system_prompt: str = "You are SE-LLM, an expert software engineering assistant. Write clean, correct, well-documented code.",
+    system_prompt: str = "You are Aarohan, an expert software engineering assistant. Write clean, correct, well-documented code.",
     history: list = None,
     max_new_tokens: int = 512,
     temperature: float = 0.7,
@@ -115,11 +118,11 @@ def chat_turn(
 
 def interactive_chat(model, tokenizer, device):
     """Run an interactive chat session in the terminal."""
-    system = "You are SE-LLM, an expert software engineering assistant."
+    system = "You are Aarohan, an expert software engineering assistant."
     history = []
 
     print("\n" + "="*55)
-    print("  SE-LLM Interactive Chat")
+    print("  Aarohan-350M Interactive Chat")
     print("  Type 'quit' to exit | 'clear' to reset history")
     print("="*55 + "\n")
 
@@ -139,7 +142,7 @@ def interactive_chat(model, tokenizer, device):
             print("[History cleared]\n")
             continue
 
-        print("\nSE-LLM: ", end="", flush=True)
+        print("\nAarohan: ", end="", flush=True)
         response = chat_turn(model, tokenizer, user_input, system, history, device=device)
         print(response)
         print()
