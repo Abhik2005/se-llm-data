@@ -41,7 +41,6 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -359,15 +358,12 @@ def sft_worker(index: int, args: argparse.Namespace) -> None:
             optimizer.zero_grad(set_to_none=True)
 
             # ── Forward ───────────────────────────────────────────
+            # Pass targets directly to the model — it computes full-sequence
+            # logits internally and uses ignore_index=-1 to skip non-assistant
+            # tokens (system/user). This avoids the [B,1,V] vs [B,T,V] mismatch
+            # that happens when calling model(x) without targets (inference mode).
             with autocast_ctx:
-                logits, _ = model(x)   # [B, SFT_MAX_LEN-1, vocab_size]
-
-                # Loss only on assistant tokens (y == -1 is ignored)
-                loss = F.cross_entropy(
-                    logits.view(-1, model_cfg.vocab_size),
-                    y.view(-1),
-                    ignore_index=-1,
-                )
+                _, loss = model(x, y)   # model handles ignore_index=-1 internally
 
             # ── Backward ──────────────────────────────────────────
             loss.backward()
