@@ -145,9 +145,8 @@ class SFTDataset(Dataset):
         text      = self._format_chatml(messages)
         token_ids = self.tokenizer.encode(text).ids[:self.max_seq_len]
 
-        # Build loss mask: find where the assistant response starts in token space
-        # by decoding prefix subsets until we find the boundary character position.
-        loss_mask = self._build_loss_mask_by_text(text, token_ids)
+        # Build loss mask using token-sequence matching (robust against special token stripping)
+        loss_mask = self._build_loss_mask(token_ids)
 
         # Pad to fixed length
         pad_len   = self.max_seq_len - len(token_ids)
@@ -171,66 +170,44 @@ class SFTDataset(Dataset):
             text   += f"<|im_start|>{role}\n{content}<|im_end|>\n"
         return text
 
-    def _build_loss_mask_by_text(self, full_text: str, token_ids: list) -> list:
+    def _build_loss_mask(self, token_ids: list) -> list:
         """
-        Find where EACH assistant response starts in token space by decoding
-        prefix subsets. This avoids depending on special token IDs that may
-        not be in the vocabulary as single tokens.
+        Mark only the assistant response tokens with mask=1.
 
-        For each assistant block we set mask=1 for its response tokens only
-        (everything after '<|im_start|>assistant\\n' up to '<|im_end|>').
-        Falls back to mask=1 on everything if no assistant block found
-        (better than mask=0 which gives zero gradients).
+        Finds '<|im_start|>assistant\n' as a token sub-sequence,
+        then marks every token until the next '<|im_end|>' as 1.
+        This is robust against the tokenizer's special-token stripping
+        that broke the previous character-counting approach.
         """
+        im_end_id   = self.tokenizer.token_to_id("<|im_end|>")
+        asst_prefix = self.tokenizer.encode("<|im_start|>assistant\n").ids
+        prefix_len  = len(asst_prefix)
+
         mask = [0] * len(token_ids)
+        in_assistant = False
 
-        # Find all assistant block start positions in the character sequence
-        ASST_MARKER = "<|im_start|>assistant\n"
-        END_MARKER  = "<|im_end|>"
+        i = 0
+        while i < len(token_ids):
+            if not in_assistant:
+                # Look for the full assistant header as a token sequence
+                if (i + prefix_len <= len(token_ids) and
+                        token_ids[i:i + prefix_len] == asst_prefix):
+                    in_assistant = True
+                    i += prefix_len
+                    continue
+                i += 1
+            else:
+                # Mark every token in the assistant response (including <|im_end|>)
+                mask[i] = 1
+                if token_ids[i] == im_end_id:
+                    in_assistant = False
+                i += 1
 
-        char_pos = 0
-        segments = []   # list of (char_start, char_end) for each assistant response
-
-        while True:
-            start = full_text.find(ASST_MARKER, char_pos)
-            if start == -1:
-                break
-            resp_start = start + len(ASST_MARKER)
-            resp_end   = full_text.find(END_MARKER, resp_start)
-            if resp_end == -1:
-                resp_end = len(full_text)
-            segments.append((resp_start, resp_end))
-            char_pos = resp_end + len(END_MARKER)
-
-        if not segments:
-            # No assistant block found — train on all tokens (still useful)
+        if sum(mask) == 0:
+            # Fallback: no assistant block found — train on all tokens
             return [1] * len(token_ids)
 
-        # Map character positions → token positions by decoding cumulative prefixes.
-        # We decode incrementally: decode(token_ids[:k]) and check character length.
-        seg_idx    = 0
-        char_count = 0
-        in_segment = False
-
-        for tok_idx, tok_id in enumerate(token_ids):
-            decoded = self.tokenizer.decode([tok_id])
-            char_start = char_count
-            char_end   = char_count + len(decoded)
-            char_count = char_end
-
-            if seg_idx < len(segments):
-                seg_s, seg_e = segments[seg_idx]
-                # Check if this token falls inside the current assistant segment
-                if char_end > seg_s and char_start < seg_e:
-                    mask[tok_idx] = 1
-                    in_segment = True
-                else:
-                    if in_segment and char_start >= seg_e:
-                        seg_idx   += 1
-                        in_segment = False
-
         return mask
-
 
 
 def sft_collate_fn(batch: list) -> dict:
