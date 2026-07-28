@@ -103,15 +103,15 @@ sft:
   checkpoint_dir:       "checkpoints_sft"
 
   # Training scale
-  epochs:               3                 # 3 passes over the 146K samples
+  epochs:               6                 # 6 passes (was 3 — 3 not enough for instruction following)
   batch_size:           4                 # sequences per TPU chip per step
   # NOTE: gradient_accumulation is always 1 on TPU (prevents XLA graph unrolling OOM)
   # Effective batch = 4 per chip × 8 chips = 32 sequences per step
 
-  # Optimizer — much lower LR than pre-training to avoid catastrophic forgetting
-  learning_rate:        1.0e-5            # 20× lower than pre-training (2e-4)
+  # Optimizer — slightly higher LR than round 1 to drive more learning
+  learning_rate:        3.0e-5            # raised from 1e-5 (3× higher for better convergence)
   min_lr:               1.0e-6
-  warmup_steps:         100
+  warmup_steps:         200
   grad_clip:            1.0
 
   # Logging
