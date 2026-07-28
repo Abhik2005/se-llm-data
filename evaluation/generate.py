@@ -92,15 +92,17 @@ def generate_streaming(
     tokenizer,
     prompt: str,
     max_new_tokens: int = 200,
-    temperature: float = 0.7,
-    top_k: int = 50,
+    temperature: float = 0.4,
+    top_k: int = 40,
     top_p: float = 0.95,
     eos_token_id: int = None,
+    rep_penalty: float = 1.3,
     device: torch.device = torch.device("cpu"),
 ) -> str:
     """
     Generate text token-by-token, printing each token immediately.
     This makes local CPU inference feel responsive instead of hanging silently.
+    rep_penalty > 1.0 penalises recently generated tokens to break repetition loops.
     """
     import torch.nn.functional as F
 
@@ -114,8 +116,16 @@ def generate_streaming(
     with torch.no_grad():
         for _ in range(max_new_tokens):
             ctx = ids[:, -model.config.max_seq_len:]
-            logits, _ = model(ctx)          # [1, 1, vocab_size]
+            logits, _ = model(ctx)          # [1, T, vocab_size]
             logits = logits[:, -1, :]       # [1, vocab_size]
+
+            # ── Repetition penalty ────────────────────────────────
+            if rep_penalty != 1.0 and generated_ids:
+                for prev_tok in set(generated_ids[-64:]):   # look at last 64 tokens
+                    if logits[0, prev_tok] > 0:
+                        logits[0, prev_tok] /= rep_penalty
+                    else:
+                        logits[0, prev_tok] *= rep_penalty
 
             if temperature != 1.0:
                 logits = logits / temperature
@@ -152,8 +162,9 @@ def chat_turn(
     user_message: str,
     system_prompt: str = "You are Aarohan, an expert software engineering assistant. Write clean, correct, well-documented code.",
     history: list = None,
-    max_new_tokens: int = 200,
-    temperature: float = 0.7,
+    max_new_tokens: int = 256,
+    temperature: float = 0.4,
+    rep_penalty: float = 1.3,
     device: torch.device = torch.device("cpu"),
     stream: bool = False,
 ) -> str:
@@ -178,6 +189,7 @@ def chat_turn(
             model, tokenizer, prompt,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
+            rep_penalty=rep_penalty,
             eos_token_id=im_end_id,
             device=device,
         )
@@ -228,7 +240,7 @@ def interactive_chat(model, tokenizer, device):
         print("\nAarohan: ", end="", flush=True)
         response = chat_turn(
             model, tokenizer, user_input, system, history,
-            device=device, stream=streaming,
+            device=device, stream=streaming, rep_penalty=1.3,
         )
         print()
 
@@ -243,9 +255,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode",            type=str, default="chat",
                         choices=["chat", "completion"])
     parser.add_argument("--prompt",          type=str, default="def binary_search(arr, target):")
-    parser.add_argument("--max-new-tokens",  type=int, default=256)
-    parser.add_argument("--temperature",     type=float, default=0.8)
-    parser.add_argument("--top-k",           type=int,   default=50)
+    parser.add_argument("--max-new-tokens",  type=int,   default=256)
+    parser.add_argument("--temperature",     type=float, default=0.4)
+    parser.add_argument("--top-k",           type=int,   default=40)
+    parser.add_argument("--rep-penalty",     type=float, default=1.3,
+                        help="Repetition penalty >1.0 discourages looping tokens")
     return parser.parse_args()
 
 

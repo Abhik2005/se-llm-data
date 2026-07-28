@@ -103,7 +103,7 @@ sft:
   checkpoint_dir:       "checkpoints_sft"
 
   # Training scale
-  epochs:               6                 # 6 passes (was 3 — 3 not enough for instruction following)
+  epochs:               12                # Round 4: doubled (6→12) to override pre-train Perl priors
   batch_size:           4                 # sequences per TPU chip per step
   # NOTE: gradient_accumulation is always 1 on TPU (prevents XLA graph unrolling OOM)
   # Effective batch = 4 per chip × 8 chips = 32 sequences per step
