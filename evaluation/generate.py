@@ -33,10 +33,18 @@ def load_model_from_checkpoint(ckpt_path: str, device: torch.device):
     model_cfg = ModelConfig.from_dict(ckpt["model_config"])
     model     = Transformer(model_cfg).to(device)
     model.load_state_dict(ckpt["model_state"])
+
+    # TPU checkpoints are saved in bfloat16.
+    # bfloat16 has NO hardware acceleration on CPU → cast to float32 for local inference.
+    # On CUDA, keep bfloat16 (supported natively and faster).
+    if device.type == "cpu":
+        model = model.to(torch.float32)
+
     model.eval()
 
     print(f"Model loaded: {model_cfg.name} ({model.n_params/1e6:.1f}M params)")
     return model, model_cfg
+
 
 
 def load_tokenizer(tokenizer_path: str):
