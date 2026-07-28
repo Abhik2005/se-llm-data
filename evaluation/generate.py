@@ -87,19 +87,80 @@ def generate_completion(
     return tokenizer.decode(generated_ids)
 
 
+def generate_streaming(
+    model: Transformer,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int = 200,
+    temperature: float = 0.7,
+    top_k: int = 50,
+    top_p: float = 0.95,
+    eos_token_id: int = None,
+    device: torch.device = torch.device("cpu"),
+) -> str:
+    """
+    Generate text token-by-token, printing each token immediately.
+    This makes local CPU inference feel responsive instead of hanging silently.
+    """
+    import torch.nn.functional as F
+
+    if eos_token_id is None:
+        eos_token_id = tokenizer.token_to_id("<|endoftext|>")
+
+    input_ids = tokenizer.encode(prompt).ids
+    ids = torch.tensor([input_ids], dtype=torch.long).to(device)
+    generated_ids = []
+
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            ctx = ids[:, -model.config.max_seq_len:]
+            logits, _ = model(ctx)          # [1, 1, vocab_size]
+            logits = logits[:, -1, :]       # [1, vocab_size]
+
+            if temperature != 1.0:
+                logits = logits / temperature
+            if top_k > 0:
+                kth = torch.topk(logits, min(top_k, logits.size(-1))).values[:, -1, None]
+                logits = logits.masked_fill(logits < kth, float("-inf"))
+            if top_p < 1.0:
+                s_logits, s_idx = torch.sort(logits, descending=True)
+                cump = torch.cumsum(F.softmax(s_logits, dim=-1), dim=-1)
+                s_logits[cump - F.softmax(s_logits, dim=-1) > top_p] = float("-inf")
+                logits = torch.zeros_like(logits).scatter_(1, s_idx, s_logits)
+
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            token_id = next_token.item()
+
+            if token_id == eos_token_id:
+                break
+
+            generated_ids.append(token_id)
+            ids = torch.cat([ids, next_token], dim=1)
+
+            # ── Stream token to screen immediately ────────────────
+            token_text = tokenizer.decode([token_id])
+            print(token_text, end="", flush=True)
+
+    print()  # newline after response
+    return tokenizer.decode(generated_ids)
+
+
 def chat_turn(
     model: Transformer,
     tokenizer,
     user_message: str,
     system_prompt: str = "You are Aarohan, an expert software engineering assistant. Write clean, correct, well-documented code.",
     history: list = None,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 200,
     temperature: float = 0.7,
     device: torch.device = torch.device("cpu"),
+    stream: bool = False,
 ) -> str:
     """
     Generate a chat response in ChatML format.
     history: list of {"role": ..., "content": ...} dicts
+    stream:  if True, print each token as it's generated (best for CPU)
     """
     # Build ChatML prompt
     prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
@@ -111,13 +172,23 @@ def chat_turn(
     prompt += f"<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n"
 
     im_end_id = tokenizer.token_to_id("<|im_end|>")
-    response  = generate_completion(
-        model, tokenizer, prompt,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        eos_token_id=im_end_id,
-        device=device,
-    )
+
+    if stream:
+        response = generate_streaming(
+            model, tokenizer, prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            eos_token_id=im_end_id,
+            device=device,
+        )
+    else:
+        response = generate_completion(
+            model, tokenizer, prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            eos_token_id=im_end_id,
+            device=device,
+        )
 
     # Strip trailing <|im_end|> if present
     response = response.split("<|im_end|>")[0].strip()
@@ -126,12 +197,16 @@ def chat_turn(
 
 def interactive_chat(model, tokenizer, device):
     """Run an interactive chat session in the terminal."""
-    system = "You are Aarohan, an expert software engineering assistant."
+    system  = "You are Aarohan, an expert software engineering assistant."
     history = []
+    # Use streaming on CPU (tokens appear one by one as generated)
+    # On GPU it's fast enough that streaming isn't needed, but doesn't hurt
+    streaming = True
 
     print("\n" + "="*55)
     print("  Aarohan-350M Interactive Chat")
     print("  Type 'quit' to exit | 'clear' to reset history")
+    print("  (streaming mode — tokens appear as generated)")
     print("="*55 + "\n")
 
     while True:
@@ -151,8 +226,10 @@ def interactive_chat(model, tokenizer, device):
             continue
 
         print("\nAarohan: ", end="", flush=True)
-        response = chat_turn(model, tokenizer, user_input, system, history, device=device)
-        print(response)
+        response = chat_turn(
+            model, tokenizer, user_input, system, history,
+            device=device, stream=streaming,
+        )
         print()
 
         history.append({"role": "user",      "content": user_input})
