@@ -243,12 +243,7 @@ def ddp_main(rank: int, world_size: int, args: argparse.Namespace) -> None:
             targets = batch["targets"].to(device, non_blocking=True)
 
             with torch.amp.autocast('cuda', dtype=torch.float16):
-                logits, _ = model(input_ids)
-                loss = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)),
-                    targets.reshape(-1),
-                    ignore_index=-1
-                )
+                logits, loss = model(input_ids, targets=targets)
                 loss = loss / grad_accum_steps
 
             scaler.scale(loss).backward()
