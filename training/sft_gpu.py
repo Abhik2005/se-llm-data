@@ -142,10 +142,10 @@ def ddp_main(rank: int, world_size: int, args: argparse.Namespace) -> None:
     min_lr         = sft_cfg.get("min_lr",          1e-6)
     warmup_steps   = sft_cfg.get("warmup_steps",    200)
     epochs         = sft_cfg.get("epochs",          12)
-    batch_size     = sft_cfg.get("batch_size",      4)
-    # T4 x2 means we need gradient accumulation to match the TPU's effective batch size of 32
-    # 2 GPUs * 4 batch size * 4 accum = 32 effective batch size
-    grad_accum_steps = args.gradient_accumulation
+    # T4 has only 16GB VRAM, batch size 4 OOMs. Force batch size to 1.
+    batch_size = 1
+    # To maintain effective batch size 32: 2 GPUs * 1 batch size * 16 accum = 32
+    grad_accum_steps = args.gradient_accumulation * 4
     grad_clip      = sft_cfg.get("grad_clip",       1.0)
     checkpoint_dir = sft_cfg.get("checkpoint_dir",  "checkpoints_sft")
     data_path      = sft_cfg.get("dataset",         "data/sft/sft_data.jsonl")
