@@ -284,7 +284,7 @@ def ddp_main(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
                 # Save checkpoint periodically
                 if step > 0 and step % 1000 == 0 and is_master:
-                    save_path = os.path.join(checkpoint_dir, f"sft_gpu_step_{step}.pt")
+                    save_path = os.path.join(checkpoint_dir, "sft_final.pt")
                     torch.save({
                         "step": step,
                         "epoch": epoch,
@@ -301,7 +301,7 @@ def ddp_main(rank: int, world_size: int, args: argparse.Namespace) -> None:
                 t0 = time.time()
 
         if is_master:
-            save_path = os.path.join(checkpoint_dir, f"sft_gpu_epoch_{epoch+1}.pt")
+            save_path = os.path.join(checkpoint_dir, "sft_final.pt")
             torch.save({
                 "step": step,
                 "epoch": epoch + 1,
@@ -311,9 +311,6 @@ def ddp_main(rank: int, world_size: int, args: argparse.Namespace) -> None:
                 "tokens_processed": tokens_processed
             }, save_path)
             
-            # Update final pointer
-            final_path = os.path.join(checkpoint_dir, "sft_final.pt")
-            shutil.copy2(save_path, final_path)
             print(f"Epoch {epoch+1} complete. Checkpoint saved.")
 
     cleanup()
